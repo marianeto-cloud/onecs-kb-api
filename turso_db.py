@@ -33,9 +33,41 @@ def _open_libsql_connection():
     return libsql.connect(db_url, auth_token=auth_token)
 
 
+# ------------------------------------------------------------------
+# Turso HTTP v2 / pipeline helpers
+# ------------------------------------------------------------------
+
+def _convert_args(args):
+    """
+    Convert a list of plain Python values to Turso typed format.
+
+    Turso v2 typed values:
+      str  → {"type": "text",   "value": val}
+      int  → {"type": "integer","value": val}
+      float→ {"type": "float",  "value": val}
+      None → {"type": "null"}
+      bool → {"type": "integer","value": 1 if val else 0}
+    """
+    if args is None:
+        return []
+    typed = []
+    for val in args:
+        if val is None:
+            typed.append({"type": "null"})
+        elif isinstance(val, bool):
+            typed.append({"type": "integer", "value": 1 if val else 0})
+        elif isinstance(val, int):
+            typed.append({"type": "integer", "value": val})
+        elif isinstance(val, float):
+            typed.append({"type": "float", "value": val})
+        else:
+            typed.append({"type": "text", "value": str(val)})
+    return typed
+
+
 def _execute_via_http(sql, args=None, fetch=True):
     """
-    Execute SQL via Turso HTTP API using urllib.
+    Execute SQL via Turso HTTP v2/pipeline API using urllib.
     Returns rows as list of dicts (column names as keys).
     """
     import urllib.request
@@ -50,11 +82,16 @@ def _execute_via_http(sql, args=None, fetch=True):
         http_url = "https://" + http_url[len("libsql://"):]
     http_url = http_url.rstrip("/") + "/v2/pipeline"
 
+    # Build the v2/pipeline request body
+    typed_args = _convert_args(args)
     body = {
-        "statements": [
+        "requests": [
             {
-                "stmt": sql,
-                "args": args if args else []
+                "type": "execute",
+                "stmt": {
+                    "sql": sql,
+                    "args": typed_args,
+                }
             }
         ]
     }
@@ -79,16 +116,45 @@ def _execute_via_http(sql, args=None, fetch=True):
     except urllib.error.URLError as e:
         raise RuntimeError(f"Turso connection error: {e.reason}") from e
 
-    # Parse results
-    # Response format: {"results": [{"columns": [...], "rows": [...], "cols_changed": n}]}
+    # Parse Turso v2 response:
+    # {
+    #   "results": [
+    #     {
+    #       "type": "ok",
+    #       "response": {
+    #         "result": {
+    #           "cols": [{"name": "id", "decltype": "INTEGER"}, ...],
+    #           "rows": [[{"type": "integer", "value": 1}, ...], ...]
+    #         }
+    #       }
+    #     }
+    #   ]
+    # }
     results = result.get("results", [])
     if not results:
         return []
 
     first = results[0]
-    columns = first.get("columns", [])
-    rows = first.get("rows", [])
-    return [dict(zip(columns, row)) for row in rows]
+    # An error response may have "type": "error" instead of "ok"
+    if first.get("type") != "ok":
+        error_msg = first.get("response", {}).get("error", str(first))
+        raise RuntimeError(f"Turso HTTP API error: {error_msg}")
+
+    res_data = first.get("response", {})
+    result_obj = res_data.get("result", {})
+    cols_meta = result_obj.get("cols", [])
+    rows_typed = result_obj.get("rows", [])
+
+    # Extract column names
+    columns = [col.get("name") for col in cols_meta]
+
+    # Extract values from typed row objects
+    rows = []
+    for row in rows_typed:
+        values = [cell.get("value") for cell in row]
+        rows.append(dict(zip(columns, values)))
+
+    return rows
 
 
 def _execute_sql(sql, args=None, fetch=True):
