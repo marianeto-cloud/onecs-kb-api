@@ -1,0 +1,12 @@
+[
+  {
+    "id": 1,
+    "titulo": "Teste OneCs",
+    "categoria": "procedimentos",
+    "conteudo": "Conteudo de teste",
+    "tags": [],
+    "fonte": "api",
+    "data_criacao": "2026-07-23T11:55:21Z",
+    "status": "active"
+  }
+]
