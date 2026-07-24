@@ -180,8 +180,12 @@ def _execute_via_http(sql, args=None):
 
     res_data = first.get("response", {})
     result_obj = res_data.get("result", {})
-    cols_meta = result_obj.get("cols", [])
-    rows_typed = result_obj.get("rows", [])
+    # .get(key, []) só usa o default quando a CHAVE está ausente — se a
+    # Turso devolver "cols": null / "rows": null (chave presente com valor
+    # None, o que acontece em algumas respostas DDL), .get() devolve None
+    # na mesma, e o for/zip seguinte rebentava. Daí o "or []" adicional.
+    cols_meta = result_obj.get("cols", []) or []
+    rows_typed = result_obj.get("rows", []) or []
 
     columns = [col.get("name") for col in cols_meta]
 
@@ -211,7 +215,11 @@ def _execute(sql, args=None, commit=False):
             rows = []
             if cur.description is not None:
                 columns = [col[0] for col in cur.description]
-                rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+                # cur.fetchall() pode devolver None (não apenas lista vazia)
+                # em algumas instruções DDL como CREATE TABLE, mesmo quando
+                # cur.description não é None — daí o "or []" defensivo.
+                fetched = cur.fetchall() or []
+                rows = [dict(zip(columns, row)) for row in fetched]
             if commit:
                 conn.commit()
             return rows
