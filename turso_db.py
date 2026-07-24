@@ -1,19 +1,36 @@
 """
 Turso (libSQL) database module for OneCs KB API.
-Uses libsql-client if available, falls back to HTTP API via urllib.
+
+Usa o pacote oficial `libsql` quando disponível (ligação direta, rápida e
+com tipos corretos). Se por algum motivo não estiver instalado, cai para
+uma implementação manual sobre a HTTP API v2/pipeline do Turso via urllib.
+
+Tabelas geridas por este módulo:
+  - knowledge_entries: conhecimento dinâmico (add_knowledge / list / get / delete)
+  - topic_versions:    histórico de versões de tópicos (para poder reverter)
+  - topic_overrides:   conteúdo ATIVO de um tópico depois de ser atualizado
+                        (substitui o ficheiro estático enquanto o servidor
+                        estiver a usar Turso — sem isto, uma atualização de
+                        tópico perder-se-ia a cada redeploy no Render free tier)
 """
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ------------------------------------------------------------------
 # Connection helpers
 # ------------------------------------------------------------------
 
 def _get_turso_config():
-    """Read Turso configuration from environment variables."""
-    db_url = os.environ.get("TURSO_DATABASE_URL", "")
-    auth_token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    """Read Turso configuration from environment variables.
+
+    .strip() é importante aqui: colar as credenciais no Render (ou no
+    terminal) facilmente introduz um espaço ou quebra de linha invisível
+    no início/fim do valor, o que corrompe o URL e o header Authorization
+    sem dar um erro óbvio.
+    """
+    db_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    auth_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
     return db_url, auth_token
 
 
@@ -23,18 +40,27 @@ def _is_turso_configured():
     return bool(db_url and auth_token)
 
 
+def _is_libsql_available():
+    """Check if the official `libsql` package is installed and importable."""
+    try:
+        import libsql  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _open_libsql_connection():
     """
-    Open a libsql connection using the libsql-client package.
+    Open a libsql connection using the official `libsql` package.
     Raises ImportError if the package is not available.
     """
     import libsql
     db_url, auth_token = _get_turso_config()
-    return libsql.connect(db_url, auth_token=auth_token)
+    return libsql.connect(database=db_url, auth_token=auth_token)
 
 
 # ------------------------------------------------------------------
-# Turso HTTP v2 / pipeline helpers
+# Turso HTTP v2 / pipeline helpers (fallback quando `libsql` não está instalado)
 # ------------------------------------------------------------------
 
 def _convert_args(args):
@@ -65,10 +91,34 @@ def _convert_args(args):
     return typed
 
 
-def _execute_via_http(sql, args=None, fetch=True):
+def _decode_typed_value(cell):
+    """Converte uma célula tipada do Turso (ex: {"type": "integer", "value": "1"})
+    de volta para o tipo Python nativo correto.
+
+    IMPORTANTE: o Turso devolve "integer" e "float" com o valor como STRING
+    (para não perder precisão em inteiros de 64 bits). Sem esta conversão,
+    algo como COUNT(*) chega como a string "0" em vez do número 0, o que
+    depois rebenta em comparações como `count_entries() > 0`
+    (TypeError: '>' not supported between instances of 'str' and 'int').
+    """
+    cell_type = cell.get("type")
+    value = cell.get("value")
+
+    if cell_type == "null" or value is None:
+        return None
+    if cell_type == "integer":
+        return int(value)
+    if cell_type == "float":
+        return float(value)
+    # "text", "blob" e quaisquer outros tipos ficam como vieram (string)
+    return value
+
+
+def _execute_via_http(sql, args=None):
     """
     Execute SQL via Turso HTTP v2/pipeline API using urllib.
-    Returns rows as list of dicts (column names as keys).
+    Returns rows as list of dicts (column names as keys), com os valores
+    já convertidos para os tipos Python corretos (int/float/None/str).
     """
     import urllib.request
     import urllib.error
@@ -80,9 +130,12 @@ def _execute_via_http(sql, args=None, fetch=True):
     http_url = db_url
     if http_url.startswith("libsql://"):
         http_url = "https://" + http_url[len("libsql://"):]
-    http_url = http_url.rstrip("/") + "/v2/pipeline"
+    http_url = http_url.rstrip("/")
+    # Proteção extra: se a variável de ambiente já incluir "/v2/pipeline"
+    # por engano, não duplicamos o sufixo.
+    if not http_url.endswith("/v2/pipeline"):
+        http_url = http_url + "/v2/pipeline"
 
-    # Build the v2/pipeline request body
     typed_args = _convert_args(args)
     body = {
         "requests": [
@@ -116,26 +169,11 @@ def _execute_via_http(sql, args=None, fetch=True):
     except urllib.error.URLError as e:
         raise RuntimeError(f"Turso connection error: {e.reason}") from e
 
-    # Parse Turso v2 response:
-    # {
-    #   "results": [
-    #     {
-    #       "type": "ok",
-    #       "response": {
-    #         "result": {
-    #           "cols": [{"name": "id", "decltype": "INTEGER"}, ...],
-    #           "rows": [[{"type": "integer", "value": 1}, ...], ...]
-    #         }
-    #       }
-    #     }
-    #   ]
-    # }
     results = result.get("results", [])
     if not results:
         return []
 
     first = results[0]
-    # An error response may have "type": "error" instead of "ok"
     if first.get("type") != "ok":
         error_msg = first.get("response", {}).get("error", str(first))
         raise RuntimeError(f"Turso HTTP API error: {error_msg}")
@@ -145,57 +183,49 @@ def _execute_via_http(sql, args=None, fetch=True):
     cols_meta = result_obj.get("cols", [])
     rows_typed = result_obj.get("rows", [])
 
-    # Extract column names
     columns = [col.get("name") for col in cols_meta]
 
-    # Extract values from typed row objects
     rows = []
     for row in rows_typed:
-        values = [cell.get("value") for cell in row]
+        values = [_decode_typed_value(cell) for cell in row]
         rows.append(dict(zip(columns, values)))
 
     return rows
 
 
-def _execute_sql(sql, args=None, fetch=True):
+def _execute(sql, args=None, commit=False):
     """
-    Execute SQL using libsql if available, otherwise HTTP API.
-    Returns rows when fetch=True, affected row count when fetch=False.
+    Executa uma instrução SQL, devolvendo sempre uma lista de dicts
+    (mesmo para INSERT/UPDATE/DELETE com RETURNING, ou lista vazia
+    para instruções sem RETURNING).
+
+    Usa o pacote `libsql` quando disponível; caso contrário usa a HTTP API.
+    Esta função única substitui os antigos `_execute_sql`/`fetch=True|False`
+    para eliminar a ambiguidade que causava bugs (ex: usar duas ligações
+    separadas para INSERT + last_insert_rowid()).
     """
     if _is_libsql_available():
         conn = _open_libsql_connection()
-        cur = conn.cursor()
-        cur.execute(sql, args or [])
-        if fetch:
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description] if cur.description else []
-            return [dict(zip(cols, row)) for row in rows]
-        else:
-            conn.commit()
-            return cur.rowcount if hasattr(cur, "rowcount") else conn.total_changes
+        try:
+            cur = conn.execute(sql, args or [])
+            rows = []
+            if cur.description is not None:
+                columns = [col[0] for col in cur.description]
+                rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+            if commit:
+                conn.commit()
+            return rows
+        finally:
+            conn.close()
     else:
-        if fetch:
-            return _execute_via_http(sql, args)
-        else:
-            # For non-fetch queries via HTTP, run without returning rows
-            _execute_via_http(sql, args, fetch=False)
-            return 0
-
-
-def _is_libsql_available():
-    """Check if libsql-client package is installed and importable."""
-    try:
-        import libsql  # noqa: F401
-        return True
-    except ImportError:
-        return False
+        return _execute_via_http(sql, args)
 
 
 # ------------------------------------------------------------------
 # Schema management
 # ------------------------------------------------------------------
 
-CREATE_TABLE_SQL = """
+CREATE_KNOWLEDGE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS knowledge_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     titulo TEXT NOT NULL,
@@ -208,37 +238,54 @@ CREATE TABLE IF NOT EXISTS knowledge_entries (
 );
 """
 
+CREATE_TOPIC_VERSIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS topic_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT NOT NULL,
+    product TEXT NOT NULL,
+    version TEXT,
+    nota TEXT,
+    conteudo_backup TEXT NOT NULL,
+    data_atualizacao TEXT
+);
+"""
+
+CREATE_TOPIC_OVERRIDES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS topic_overrides (
+    topic TEXT NOT NULL,
+    product TEXT NOT NULL,
+    conteudo TEXT NOT NULL,
+    atualizado_em TEXT,
+    PRIMARY KEY (topic, product)
+);
+"""
+
 
 def init_db():
     """
-    Create the knowledge_entries table if it does not exist.
-    Uses libsql if available, otherwise HTTP API.
+    Create all required tables if they do not exist yet.
     """
-    _execute_sql(CREATE_TABLE_SQL, fetch=False)
-    if _is_turso_configured() and not _is_libsql_available():
-        # HTTP API commits automatically
-        pass
-    else:
-        conn = _open_libsql_connection()
-        conn.commit()
-        conn.close()
+    _execute(CREATE_KNOWLEDGE_TABLE_SQL, commit=True)
+    _execute(CREATE_TOPIC_VERSIONS_TABLE_SQL, commit=True)
+    _execute(CREATE_TOPIC_OVERRIDES_TABLE_SQL, commit=True)
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ------------------------------------------------------------------
-# CRUD operations
+# CRUD: conhecimento dinâmico
 # ------------------------------------------------------------------
 
 def list_entries():
-    """
-    Return all knowledge entries as summary (no full conteudo).
-    Returns list of dicts.
-    """
+    """Return all knowledge entries as summary (no full conteudo)."""
     sql = """
     SELECT id, titulo, categoria, tags, fonte, data_criacao, status
     FROM knowledge_entries
     ORDER BY id ASC;
     """
-    rows = _execute_sql(sql)
+    rows = _execute(sql)
     entries = []
     for row in rows:
         tags_val = row.get("tags", "")
@@ -259,16 +306,13 @@ def list_entries():
 
 
 def get_entry(entry_id):
-    """
-    Return a single knowledge entry by ID (with full conteudo).
-    Returns dict or None if not found.
-    """
+    """Return a single knowledge entry by ID (with full conteudo), or None."""
     sql = """
     SELECT id, titulo, categoria, conteudo, tags, fonte, data_criacao, status
     FROM knowledge_entries
     WHERE id = ?;
     """
-    rows = _execute_sql(sql, args=[entry_id])
+    rows = _execute(sql, args=[entry_id])
     if not rows:
         return None
     row = rows[0]
@@ -294,13 +338,19 @@ def add_entry(data):
     Insert a new knowledge entry.
     data is a dict with: titulo, categoria, conteudo, tags, fonte.
     Returns the created entry dict (with id and data_criacao).
-    """
-    sql = """
-    INSERT INTO knowledge_entries (titulo, categoria, conteudo, tags, fonte, data_criacao, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?);
+
+    Usa "RETURNING id" para obter o novo ID na MESMA operação que faz o
+    INSERT — evita uma ronda extra a perguntar last_insert_rowid(), que era
+    arriscado sob concorrência (podia devolver o ID de OUTRO pedido em
+    simultâneo, já que cada chamada HTTP é uma ligação nova).
     """
     tags_json = json.dumps(data.get("tags", []), ensure_ascii=False)
-    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = _now_iso()
+    sql = """
+    INSERT INTO knowledge_entries (titulo, categoria, conteudo, tags, fonte, data_criacao, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    RETURNING id;
+    """
     args = [
         data.get("titulo"),
         data.get("categoria"),
@@ -310,20 +360,8 @@ def add_entry(data):
         timestamp,
         "active",
     ]
-    _execute_sql(sql, args=args, fetch=False)
-
-    # Get the ID of the inserted row
-    if _is_libsql_available():
-        conn = _open_libsql_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT last_insert_rowid() as id;")
-        row = cur.fetchone()
-        conn.close()
-        new_id = row[0] if row else None
-    else:
-        # HTTP API: SELECT last_insert_rowid()
-        rows = _execute_sql("SELECT last_insert_rowid() as id;")
-        new_id = rows[0]["id"] if rows else None
+    rows = _execute(sql, args=args, commit=True)
+    new_id = rows[0]["id"] if rows else None
 
     return {
         "id": new_id,
@@ -340,52 +378,39 @@ def add_entry(data):
 def delete_entry(entry_id):
     """
     Delete a knowledge entry by ID.
-    Returns True if deleted, False if not found.
-    """
-    sql = "DELETE FROM knowledge_entries WHERE id = ?;"
-    _execute_sql(sql, args=[entry_id], fetch=False)
+    Returns True if a row was actually deleted, False if it didn't exist.
 
-    # Verify deletion
-    if get_entry(entry_id) is None:
-        return True
-    return False
-
-
-def get_next_id():
+    Usa "RETURNING id" para saber, na mesma operação, se algo foi mesmo
+    apagado — evita uma segunda chamada de verificação.
     """
-    Return the next available ID for a new entry.
-    """
-    sql = "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM knowledge_entries;"
-    rows = _execute_sql(sql)
-    if rows:
-        return rows[0].get("next_id", 1)
-    return 1
+    sql = "DELETE FROM knowledge_entries WHERE id = ? RETURNING id;"
+    rows = _execute(sql, args=[entry_id], commit=True)
+    return len(rows) > 0
 
 
 def count_entries():
-    """Return the total number of entries in the table."""
+    """Return the total number of entries in the table (int)."""
     sql = "SELECT COUNT(*) AS cnt FROM knowledge_entries;"
-    rows = _execute_sql(sql)
+    rows = _execute(sql)
     if rows:
         return rows[0].get("cnt", 0)
     return 0
 
 
 # ------------------------------------------------------------------
-# Migration from JSON
+# Migração inicial a partir do dynamic_knowledge.json
 # ------------------------------------------------------------------
 
 def migrate_from_json(json_path):
     """
     Read entries from dynamic_knowledge.json and insert them into Turso
-    if the table is empty (seed initial data).
+    if the table is empty (seed initial data). Não faz nada se a tabela
+    já tiver dados (evita duplicar entradas em cada arranque).
     """
-    import os
     if not os.path.exists(json_path):
         return
 
     if count_entries() > 0:
-        # Table already has data, skip migration
         return
 
     try:
@@ -397,12 +422,12 @@ def migrate_from_json(json_path):
     if not isinstance(data, list):
         return
 
+    sql = """
+    INSERT INTO knowledge_entries (titulo, categoria, conteudo, tags, fonte, data_criacao, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?);
+    """
     for entry in data:
         tags_json = json.dumps(entry.get("tags", []), ensure_ascii=False)
-        sql = """
-        INSERT INTO knowledge_entries (titulo, categoria, conteudo, tags, fonte, data_criacao, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
-        """
         args = [
             entry.get("titulo"),
             entry.get("categoria"),
@@ -412,4 +437,85 @@ def migrate_from_json(json_path):
             entry.get("data_criacao"),
             entry.get("status", "active"),
         ]
-        _execute_sql(sql, args=args, fetch=False)
+        _execute(sql, args=args, commit=True)
+
+
+# ------------------------------------------------------------------
+# CRUD: versionamento de tópicos (novo — antes só existia em ficheiros
+# locais, que se perdiam a cada redeploy no Render free tier)
+# ------------------------------------------------------------------
+
+def add_version(topic, product, version, nota, conteudo_backup):
+    """Guarda uma cópia do conteúdo ANTERIOR de um tópico, antes de o
+    atualizar ou reverter. Devolve o id da versão criada."""
+    sql = """
+    INSERT INTO topic_versions (topic, product, version, nota, conteudo_backup, data_atualizacao)
+    VALUES (?, ?, ?, ?, ?, ?)
+    RETURNING id;
+    """
+    args = [topic, product, version, nota, conteudo_backup, _now_iso()]
+    rows = _execute(sql, args=args, commit=True)
+    return rows[0]["id"] if rows else None
+
+
+def list_versions():
+    """Lista todas as versões guardadas de todos os tópicos (sem o
+    conteúdo completo do backup), mais recente primeiro."""
+    sql = """
+    SELECT id, topic, product, version, nota, data_atualizacao
+    FROM topic_versions
+    ORDER BY data_atualizacao DESC;
+    """
+    return _execute(sql)
+
+
+def list_versions_for_topic(topic):
+    """Lista as versões guardadas de um tópico específico, mais recente
+    primeiro."""
+    sql = """
+    SELECT id, topic, product, version, nota, data_atualizacao
+    FROM topic_versions
+    WHERE topic = ?
+    ORDER BY data_atualizacao DESC;
+    """
+    return _execute(sql, args=[topic])
+
+
+def get_version_backup(topic, version):
+    """Devolve o registo mais recente (com o conteúdo do backup incluído)
+    para o par (topic, version), ou None se não existir."""
+    sql = """
+    SELECT id, topic, product, version, nota, conteudo_backup, data_atualizacao
+    FROM topic_versions
+    WHERE topic = ? AND version = ?
+    ORDER BY data_atualizacao DESC
+    LIMIT 1;
+    """
+    rows = _execute(sql, args=[topic, version])
+    return rows[0] if rows else None
+
+
+# ------------------------------------------------------------------
+# CRUD: conteúdo ATIVO de tópicos atualizados (overrides)
+# ------------------------------------------------------------------
+
+def upsert_override(topic, product, conteudo):
+    """Substitui (ou cria) o conteúdo ativo de um tópico atualizado."""
+    sql = """
+    INSERT INTO topic_overrides (topic, product, conteudo, atualizado_em)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(topic, product) DO UPDATE SET
+        conteudo = excluded.conteudo,
+        atualizado_em = excluded.atualizado_em;
+    """
+    _execute(sql, args=[topic, product, conteudo, _now_iso()], commit=True)
+
+
+def get_override(topic, product):
+    """Devolve o conteúdo ativo (override) de um tópico, ou None se o
+    tópico nunca tiver sido atualizado via update_topic."""
+    sql = """
+    SELECT conteudo FROM topic_overrides WHERE topic = ? AND product = ?;
+    """
+    rows = _execute(sql, args=[topic, product])
+    return rows[0]["conteudo"] if rows else None

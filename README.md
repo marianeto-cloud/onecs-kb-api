@@ -6,18 +6,34 @@ API Flask que serve a base de conhecimento da equipa OneCs/OLX para os produtos 
 
 ```
 onecs-kb-api/
-├── app.py                 # Aplicação Flask principal
-├── confluence_sync.py     # Script para sincronizar com Confluence (correr localmente)
-├── requirements.txt       # Dependências Python
-├── render.yaml            # Configuração do Render
-├── dynamic_knowledge.json # Entradas de conhecimento dinâmico
-├── wiki_data/             # Ficheiros markdown organizados por produto
+├── app.py                 # Aplicação Flask — rotas REST + endpoint /mcp (transporte)
+├── mcp_server.py           # Protocolo MCP JSON-RPC 2.0 (transporte) — ferramentas MCP
+├── kb_core.py              # Lógica de negócio PARTILHADA por app.py e mcp_server.py
+├── turso_db.py             # Acesso à base de dados Turso (conhecimento + versões)
+├── confluence_sync.py      # Script para sincronizar com Confluence (correr localmente)
+├── requirements.txt        # Dependências Python
+├── render.yaml             # Configuração do Render
+├── dynamic_knowledge.json  # Seed inicial de conhecimento dinâmico (migrado 1x para a Turso)
+├── wiki_data/              # Ficheiros markdown organizados por produto
 │   ├── olx/
 │   ├── standvirtual/
 │   ├── imovirtual/
 │   └── transversal/
-└── versions/              # Backups de versões (gerado em runtime)
+└── versions/               # Backups de versões (fallback local, só usado sem Turso)
 ```
+
+### Porque é que app.py e mcp_server.py já não têm lógica duplicada
+
+Antes, cada um tinha a sua própria cópia de "carregar markdown", "pesquisar",
+"gerir conhecimento dinâmico" e "gerir versões" — o que significava que uma
+correção feita num ficheiro facilmente ficava esquecida no outro. Agora,
+toda essa lógica vive em `kb_core.py`; `app.py` e `mcp_server.py` são só a
+camada de "transporte" (rotas REST vs. JSON-RPC) por cima da mesma lógica.
+
+### Persistência
+
+- **Conhecimento dinâmico** (`add_knowledge`): Turso quando configurado, senão `dynamic_knowledge.json` local.
+- **Tópicos atualizados e o seu histórico de versões** (`update_topic` / `revert_topic`): também Turso quando configurado (tabelas `topic_overrides` e `topic_versions`), senão ficheiros locais em `versions/`. Isto é uma mudança em relação à versão anterior, em que o histórico de versões só existia em ficheiros locais — e por isso desaparecia a cada redeploy no Render free tier, mesmo com a Turso configurada para o conhecimento dinâmico.
 
 ## Deploy no Render
 

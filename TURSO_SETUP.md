@@ -1,5 +1,19 @@
 # Configurar Turso para a OneCs KB API
 
+> **Nota sobre a versão 2.0 deste projeto:** foram corrigidos 3 bugs reais
+> que impediam a Turso de funcionar corretamente:
+> 1. `requirements.txt` instalava o pacote `libsql-client` (descontinuado
+>    pela Turso), mas o código fazia `import libsql` (pacote diferente) —
+>    por isso a ligação "boa" nunca era usada, caindo sempre no fallback
+>    HTTP manual.
+> 2. Esse fallback HTTP não convertia os números devolvidos pela Turso (que
+>    vêm como texto, ex: `"0"`) de volta para `int`/`float`, causando erros
+>    como `'>' not supported between instances of 'str' and 'int'`.
+> 3. O histórico de versões de tópicos (`update_topic`/`revert_topic`) só
+>    existia em ficheiros locais, mesmo com a Turso configurada — por isso
+>    desaparecia a cada redeploy no Render free tier. Agora também vive na
+>    Turso (tabelas `topic_overrides` e `topic_versions`).
+
 Este guia explica como criar uma base de dados Turso e configurá-la na OneCs KB API para garantir que o conhecimento dinâmico persiste entre restarts do Render free tier.
 
 ---
