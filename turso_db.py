@@ -41,7 +41,28 @@ def _is_turso_configured():
 
 
 def _is_libsql_available():
-    """Check if the official `libsql` package is installed and importable."""
+    """Check if the official `libsql` package is installed, importable, AND
+    explicitly enabled.
+
+    IMPORTANTE: o pacote `libsql` (binding Rust/Tokio) tem um bug de
+    instabilidade conhecido quando usado dentro de apps Flask/Gunicorn —
+    sob carga, o runtime interno do Tokio pode entrar em deadlock
+    ("thread 'tokio-runtime-worker' panicked ... Resource deadlock
+    avoided") ou simplesmente bloquear indefinidamente, levando o Gunicorn
+    a matar o worker por WORKER TIMEOUT (o que causa os 502 Bad Gateway
+    vistos em produção). Isto aconteceu mesmo depois de reduzir 220
+    ligações por pedido a apenas 1 — o problema é do próprio binding, não
+    do número de ligações.
+
+    Por isso, por defeito, este caminho fica DESATIVADO e a API usa
+    sempre o caminho HTTP manual (_execute_via_http, via urllib) — mais
+    lento por pedido, mas sem o runtime Rust que está a bloquear os
+    workers. Se uma versão futura do pacote `libsql` corrigir isto e
+    quiseres voltar a testá-lo, define a variável de ambiente
+    TURSO_USE_LIBSQL=true no Render.
+    """
+    if os.environ.get("TURSO_USE_LIBSQL", "").strip().lower() != "true":
+        return False
     try:
         import libsql  # noqa: F401
         return True
