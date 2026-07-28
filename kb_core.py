@@ -21,6 +21,7 @@ PERSISTÊNCIA:
 import os
 import re
 import json
+import traceback
 from datetime import datetime, timezone
 
 import turso_db
@@ -56,6 +57,10 @@ def init(base_dir, wiki_data_dir, versions_dir, dynamic_knowledge_file, products
             turso_db.migrate_from_json(_cfg.dynamic_knowledge_file)
         except Exception as e:
             print(f"[WARN] Turso init/migrate failed: {e}")
+            # Traceback completo — a mensagem sozinha ("'NoneType' object is
+            # not iterable") não diz em que ficheiro/linha o erro ocorre.
+            # Com isto conseguimos ver exatamente onde apontar a correção.
+            traceback.print_exc()
 
 
 def turso_available() -> bool:
@@ -88,10 +93,13 @@ def load_all_markdown() -> dict:
                     all_content[rel] = {"content": content, "product": product}
 
     if turso_available():
-        # Aplica por cima qualquer override guardado (tópicos atualizados)
+        # Uma única query para TODOS os overrides, em vez de uma ligação
+        # libsql por ficheiro (era isto que sobrecarregava o runtime do
+        # libsql sob carga — ver comentário em turso_db.get_all_overrides).
+        overrides = turso_db.get_all_overrides()
         for rel, data in list(all_content.items()):
             topic_slug = os.path.splitext(os.path.basename(rel))[0]
-            override = turso_db.get_override(topic_slug, data["product"])
+            override = overrides.get((topic_slug, data["product"]))
             if override is not None:
                 all_content[rel]["content"] = override
 

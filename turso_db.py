@@ -527,3 +527,25 @@ def get_override(topic, product):
     """
     rows = _execute(sql, args=[topic, product])
     return rows[0]["conteudo"] if rows else None
+
+
+def get_all_overrides() -> dict:
+    """Devolve TODOS os overrides ativos numa única query, agrupados por
+    (topic, product) -> conteudo.
+
+    Antes, load_all_markdown() (kb_core.py) chamava get_override() uma vez
+    por CADA ficheiro .md da wiki (~220 ficheiros) — ou seja, ~220 chamadas
+    a _execute(), cada uma abrindo e fechando a sua própria ligação libsql
+    (connect()/close()). Sob carga (ex: a ferramenta MCP "search", que
+    chama load_all_markdown() internamente), esse volume de ligações
+    abertas/fechadas em sequência rápida esgotava o runtime Tokio interno
+    do pacote libsql, causando o crash observado nos logs do Render:
+    "thread 'tokio-runtime-worker' panicked ... Resource deadlock avoided",
+    seguido de WORKER TIMEOUT / SIGKILL e reinícios em ciclo.
+
+    Esta função resolve isso trazendo todos os overrides de uma só vez
+    (uma única ligação), para load_all_markdown() os consultar em memória.
+    """
+    sql = "SELECT topic, product, conteudo FROM topic_overrides;"
+    rows = _execute(sql)
+    return {(r["topic"], r["product"]): r["conteudo"] for r in rows}
